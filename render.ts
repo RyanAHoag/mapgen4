@@ -6,6 +6,17 @@
  * This module uses webgl to render the generated maps
  */
 
+/*
+ * MODIFIED — this file is changed from upstream (Apache License 2.0, §4(b)).
+ * Fork: github.com/RyanAHoag/mapgen4, branch agentic-grid, from upstream
+ * redblobgames/mapgen4 commit c1d8cb0 (2026-03-29). Changed 2026-10-18:
+ *   - an optional 3D colour table, set with setColormap3D(), looked up by
+ *     height, rain and map row instead of height and rain only, so a colour
+ *     can change across the map (for example colder towards the top).
+ *   - with no table set the renderer draws exactly as upstream does.
+ * See FORK.md for what this fork is and how it follows upstream.
+ */
+
 import {vec2, vec4, mat4} from 'gl-matrix';
 import colormap from "./colormap.ts";
 import Geometry from "./geometry.ts";
@@ -348,6 +359,8 @@ const vert_drape = `
 const frag_drape = `
     precision highp float;
     uniform sampler2D u_colormap;
+    uniform highp sampler3D u_colormap3d;   // highp: samplers have no default precision in a fragment shader
+    uniform float u_use_colormap3d;
     uniform sampler2D u_elevation;
     uniform sampler2D u_water;
     uniform sampler2D u_depth;
@@ -387,7 +400,9 @@ const frag_drape = `
             // in the ocean, or underground, don't draw rivers
             water_color.a = 0.0; neutral_biome_color = neutral_water_biome;
         }
-        vec3 biome_color = texture(u_colormap, vec2(z, v_em.y)).rgb;
+        vec3 biome_color = u_use_colormap3d > 0.5
+            ? texture(u_colormap3d, vec3(z, v_em.y, v_uv.y)).rgb   // the third axis is the map's row, top to bottom
+            : texture(u_colormap, vec2(z, v_em.y)).rgb;
         water_color = mix(vec4(neutral_water_biome * (1.2 - water_color.a), water_color.a), water_color, u_biome_colors);
         biome_color = mix(neutral_biome_color, biome_color, u_biome_colors);
         if (v_z < 0.0) {
@@ -472,6 +487,10 @@ export default class Renderer {
     webgl: WebGLWrapper;
 
     texture_colormap: Texture;
+    /* The optional 3D colour table: a 1×1×1 stand-in until one is set, so the
+     * sampler always has a texture; use_colormap3d says whether to read it. */
+    texture_colormap3d: WebGLTexture;
+    use_colormap3d: number = 0;
 
     fbo_river: Framebuffer;
     fbo_land: Framebuffer;
@@ -525,6 +544,7 @@ export default class Renderer {
         this.buffer_river_xyww = this.webgl.createBuffer({update: 'dynamic', data: this.a_river_xyww});
 
         this.texture_colormap = this.webgl.createTexture({data: colormap.data, width: colormap.width, height: colormap.height, filter: 'nearest'});
+        this.texture_colormap3d = this.createColormap3D();
 
         this.fbo_land  = this.webgl.createFramebuffer(fbo_texture_size, fbo_texture_size, {depth: false, internalFormat: this.webgl.gl.R16F, filter: 'linear'});
         this.fbo_depth = this.webgl.createFramebuffer(fbo_texture_size, fbo_texture_size, {depth: true, internalFormat: this.webgl.gl.R16F, filter: 'nearest'}); // NOTE: linear requires adjusting parameters
@@ -560,6 +580,36 @@ export default class Renderer {
 
         this.renderParam = undefined;
         this.startDrawingLoop();
+    }
+
+    /* A 3D texture, made directly: WebGLWrapper.createTexture only makes 2D
+     * ones. Clamped on all three axes, or the top row would bleed into the
+     * bottom one; linear, so colours blend between rows. */
+    createColormap3D(): WebGLTexture {
+        const {gl} = this.webgl;
+        const texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_3D, texture);
+        gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, 1, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+        for (const wrap of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) {
+            gl.texParameteri(gl.TEXTURE_3D, wrap, gl.CLAMP_TO_EDGE);
+        }
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.bindTexture(gl.TEXTURE_3D, null);
+        return texture;
+    }
+
+    /* Colour by (height, rain, map row) from this table: width is height
+     * (-1 to +1, as the 2D colormap), height is rain (0 to 1), depth is the
+     * map's rows from top to bottom. Pass null to go back to the 2D colormap.
+     * WebGL 2 promises 256 texels per side for a 3D texture. */
+    setColormap3D(data: Uint8Array | null, width: number, height: number, depth: number) {
+        if (!data) { this.use_colormap3d = 0; return; }
+        const {gl} = this.webgl;
+        gl.bindTexture(gl.TEXTURE_3D, this.texture_colormap3d);
+        gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, width, height, depth, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+        gl.bindTexture(gl.TEXTURE_3D, null);
+        this.use_colormap3d = 1;
     }
 
     screenToWorld(coords: [number, number]): vec2 {
@@ -659,6 +709,11 @@ export default class Renderer {
             this.fbo_land.texture.activate(gl.TEXTURE1, program.u_elevation);
             this.fbo_river.texture.activate(gl.TEXTURE2, program.u_water);
             this.fbo_depth.texture.activate(gl.TEXTURE3, program.u_depth);
+            // Unit 4: 0-3 are taken above, and activate() refuses 7 and up.
+            gl.uniform1f(program.u_use_colormap3d, this.use_colormap3d);
+            gl.activeTexture(gl.TEXTURE4);
+            gl.bindTexture(gl.TEXTURE_3D, this.texture_colormap3d);
+            gl.uniform1i(program.u_colormap3d, 4);
 
             gl.drawElements(gl.TRIANGLES, this.quad_elements_length, gl.UNSIGNED_INT, 0);
         });
