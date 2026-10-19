@@ -1,8 +1,7 @@
 # This fork
 
 A fork of [redblobgames/mapgen4](https://github.com/redblobgames/mapgen4) for
-the mapping prototype in [agentic_dm_platform](https://github.com/RyanAHoag/agentic_dm_platform),
-which pins it by commit.
+a mapping prototype in a private repository, which pins it by commit.
 
 **Branch `agentic-grid`**, from upstream commit `c1d8cb0` (2026-03-29). One file
 is changed, and it says so at its top:
