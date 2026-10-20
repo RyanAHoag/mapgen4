@@ -7,6 +7,16 @@
  * This module has the procedural map generation algorithms (elevations, rivers)
  */
 
+/*
+ * MODIFIED — this file is changed from upstream (Apache License 2.0, §4(b)).
+ * Fork: github.com/RyanAHoag/mapgen4, branch agentic-grid, from upstream
+ * redblobgames/mapgen4 commit c1d8cb0 (2026-03-29). Changed 2026-10-19:
+ *   - the map takes an optional world size (param.width, param.height), and
+ *     the painted constraints may be a grid of `columns` × `rows` rather than
+ *     `size` × `size`; left out, both are as upstream.
+ * See FORK.md for what this fork is and how it follows upstream.
+ */
+
 import {createNoise2D} from 'simplex-noise';
 import FlatQueue from 'flatqueue';
 import {makeRandFloat} from '@redblobgames/prng';
@@ -83,6 +93,8 @@ function precalculateNoise(randFloat: () => number, mesh: Mesh): PrecalculatedNo
 export default class Map {
     seed: number = -1;
     spacing: number;
+    width: number;
+    height: number;
     precomputed: PrecalculatedNoise;
     mountainJaggedness: number = -Infinity;
     windAngleDeg: number = Infinity;
@@ -101,7 +113,9 @@ export default class Map {
 
     constructor (public mesh: Mesh, public t_peaks: number[], param: any) {
         this.spacing = param.spacing;
-        this.elevation_t         = new Float32Array(mesh.numTriangles);
+        this.width = param.width ?? 1000;
+        this.height = param.height ?? 1000;
+        this.elevation_t        = new Float32Array(mesh.numTriangles);
         this.elevation_r         = new Float32Array(mesh.numRegions);
         this.humidity_r          = new Float32Array(mesh.numRegions);
         this.moisture_t          = new Float32Array(mesh.numTriangles);
@@ -116,8 +130,8 @@ export default class Map {
     }
 
     assignTriangleElevation(elevationParam: { noisy_coastlines: number; mountain_sharpness: number; hill_height: number; ocean_depth: number; },
-                            constraints: { constraints: Float32Array; size: any; }) {
-        let {mesh, elevation_t, mountain_distance_t, precomputed} = this;
+                            constraints: { constraints: Float32Array; size?: any; columns?: number; rows?: number; }) {
+        let {mesh, elevation_t, mountain_distance_t, precomputed, width, height} = this;
         let {numTriangles, numSolidTriangles} = mesh;
 
         // Assign elevations to triangles TODO: separate message,
@@ -131,28 +145,30 @@ export default class Map {
         // in this thread.
         function constraintAt(x: number, y: number): number {
             // https://en.wikipedia.org/wiki/Bilinear_interpolation
-            const C = constraints.constraints, size = constraints.size;
+            const C = constraints.constraints,
+                  columns = constraints.columns ?? constraints.size,
+                  rows = constraints.rows ?? constraints.size;
             // NOTE: there's a tricky "off by one" problem here. Since
             // x can be from 0.000 to 0.999, and I want xInt+1 < size
             // to leave one extra tile for bilinear filtering, that
             // means I want xInt < size-1. So I need to multiply x and
             // y by size-1, not by size.
-            x = clamp(x * (size-1), 0, size-2);
-            y = clamp(y * (size-1), 0, size-2);
+            x = clamp(x * (columns-1), 0, columns-2);
+            y = clamp(y * (rows-1), 0, rows-2);
             let xInt = Math.floor(x),
                 yInt = Math.floor(y),
                 xFrac = x - xInt,
                 yFrac = y - yInt;
-            let p = size * yInt + xInt;
+            let p = columns * yInt + xInt;
             let e00 = C[p],
             e01 = C[p + 1],
-            e10 = C[p + size],
-            e11 = C[p + size + 1];
+            e10 = C[p + columns],
+            e11 = C[p + columns + 1];
             return ((e00 * (1 - xFrac) + e01 * xFrac) * (1 - yFrac)
                 + (e10 * (1 - xFrac) + e11 * xFrac) * yFrac);
         }
         for (let t = 0; t < numSolidTriangles; t++) {
-            let e = constraintAt(mesh.x_of_t(t)/1000, mesh.y_of_t(t)/1000);
+            let e = constraintAt(mesh.x_of_t(t)/width, mesh.y_of_t(t)/height);
             // TODO: e*e*e*e seems too steep for this, as I want this
             // to apply mostly at the original coastlines and not
             // elsewhere

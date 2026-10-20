@@ -9,6 +9,15 @@
  *   * all other points
  */
 
+/*
+ * MODIFIED — this file is changed from upstream (Apache License 2.0, §4(b)).
+ * Fork: github.com/RyanAHoag/mapgen4, branch agentic-grid, from upstream
+ * redblobgames/mapgen4 commit c1d8cb0 (2026-03-29). Changed 2026-10-19:
+ *   - choosePoints() takes an optional world size; left out, it is 1000×1000
+ *     as upstream.
+ * See FORK.md for what this fork is and how it follows upstream.
+ */
+
 import Poisson from 'fast-2d-poisson-disk-sampling';
 import {makeRandFloat} from '@redblobgames/prng';
 import {generateInteriorBoundaryPoints, generateExteriorBoundaryPoints} from "./dual-mesh/create.ts";
@@ -36,11 +45,12 @@ export type PointsData = {
         
 
  */
-export function choosePoints(seed: number, spacing: number, mountainSpacing: number): PointsData {
+export function choosePoints(seed: number, spacing: number, mountainSpacing: number,
+                             world: {width: number, height: number} = {width: 1000, height: 1000}): PointsData {
     // Generate both interior and exterior boundary points; see
     // https://www.redblobgames.com/x/2314-poisson-with-boundary/
     const boundarySpacing = spacing * Math.sqrt(2);
-    const bounds = {left: 0, top: 0, width: 1000, height: 1000}; // left,top must be 0 for poisson
+    const bounds = {left: 0, top: 0, width: world.width, height: world.height}; // left,top must be 0 for poisson
     let interiorBoundaryPoints = generateInteriorBoundaryPoints(bounds, boundarySpacing);
     let exteriorBoundaryPoints = generateExteriorBoundaryPoints(bounds, boundarySpacing);
     

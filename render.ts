@@ -14,6 +14,10 @@
  *     height, rain and map row instead of height and rain only, so a colour
  *     can change across the map (for example colder towards the top).
  *   - with no table set the renderer draws exactly as upstream does.
+ * Changed 2026-10-19:
+ *   - the renderer takes an optional world size; the canvas, the textures it
+ *     draws into and the view take its shape, so a wide world fills a wide
+ *     picture. Left out, it is 1000×1000 and square, as upstream.
  * See FORK.md for what this fork is and how it follows upstream.
  */
 
@@ -342,16 +346,20 @@ const vert_drape = `
     in vec2 a_em;
     out vec2 v_em, v_uv, v_xy;
     out float v_z;
+    // u_world_inverse rather than dividing by u_world: a division by a
+    // uniform rounds differently from upstream's division by a constant, and
+    // moved a few pixels at 1000×1000. The reciprocal rounds as it did.
+    uniform vec2 u_world, u_world_inverse;
     void main() {
         v_em = a_em;
-        vec2 xy_clamped = clamp(a_xy, vec2(0, 0), vec2(1000, 1000));
+        vec2 xy_clamped = clamp(a_xy, vec2(0, 0), u_world);
         v_z = max(0.0, a_em.x); // oceans with e<0 still rendered at z=0
         if (xy_clamped != a_xy) { // boundary points
             v_z = -0.5;
             v_em = vec2(0.0, 0.0);
         }
         vec4 pos = vec4(u_projection * vec4(xy_clamped, v_z, 1));
-        v_uv = a_xy / 1000.0;
+        v_uv = a_xy * u_world_inverse;
         v_xy = (1.0 + pos.xy) * 0.5;
         gl_Position = pos;
     }`;
@@ -470,6 +478,11 @@ const fbo_texture_size: number = 2048;
 export default class Renderer {
     numRiverTriangles: number = 0;
 
+    /* The world's size in map units, and the picture's in pixels: the longer
+     * side fbo_texture_size, the other in proportion. */
+    world: {width: number, height: number};
+    picture: {width: number, height: number};
+
     topdown: mat4;
     projection: mat4;
     inverse_projection: mat4;
@@ -509,15 +522,21 @@ export default class Renderer {
     buffer_quad_elements: Buffer;
     buffer_river_xyww: Buffer;
 
-    constructor (mesh: Mesh) {
+    constructor (mesh: Mesh, world: {width: number, height: number} = {width: 1000, height: 1000}) {
         const canvas = document.getElementById('mapgen4') as HTMLCanvasElement;
         this.webgl = new WebGLWrapper(canvas);
 
+        this.world = world;
+        const longer = Math.max(world.width, world.height);
+        this.picture = {
+            width: Math.round(fbo_texture_size * world.width / longer),
+            height: Math.round(fbo_texture_size * world.height / longer),
+        };
         this.resizeCanvas();
 
         this.topdown = mat4.create();
         mat4.translate(this.topdown, this.topdown, [-1, -1, 0]);
-        mat4.scale(this.topdown, this.topdown, [1/500, 1/500, 1]);
+        mat4.scale(this.topdown, this.topdown, [2/world.width, 2/world.height, 1]);
 
         this.projection = mat4.create();
         this.inverse_projection = mat4.create();
@@ -546,10 +565,11 @@ export default class Renderer {
         this.texture_colormap = this.webgl.createTexture({data: colormap.data, width: colormap.width, height: colormap.height, filter: 'nearest'});
         this.texture_colormap3d = this.createColormap3D();
 
-        this.fbo_land  = this.webgl.createFramebuffer(fbo_texture_size, fbo_texture_size, {depth: false, internalFormat: this.webgl.gl.R16F, filter: 'linear'});
-        this.fbo_depth = this.webgl.createFramebuffer(fbo_texture_size, fbo_texture_size, {depth: true, internalFormat: this.webgl.gl.R16F, filter: 'nearest'}); // NOTE: linear requires adjusting parameters
-        this.fbo_river = this.webgl.createFramebuffer(fbo_texture_size, fbo_texture_size, {depth: false, filter: 'linear'}); // linear makes rivers look better
-        this.fbo_drape = this.webgl.createFramebuffer(fbo_texture_size, fbo_texture_size, {depth: true, filter: 'linear'}); // linear to smooth out edges
+        const {width: pw, height: ph} = this.picture;
+        this.fbo_land  = this.webgl.createFramebuffer(pw, ph, {depth: false, internalFormat: this.webgl.gl.R16F, filter: 'linear'});
+        this.fbo_depth = this.webgl.createFramebuffer(pw, ph, {depth: true, internalFormat: this.webgl.gl.R16F, filter: 'nearest'}); // NOTE: linear requires adjusting parameters
+        this.fbo_river = this.webgl.createFramebuffer(pw, ph, {depth: false, filter: 'linear'}); // linear makes rivers look better
+        this.fbo_drape = this.webgl.createFramebuffer(pw, ph, {depth: true, filter: 'linear'}); // linear to smooth out edges
 
         this.program_river = this.webgl.createProgram('river', vert_river, frag_river, (gl, program) => {
             this.buffer_river_xyww.vertexAttribPointer(program.a_xyww, 4, gl.FLOAT, false, 0, 0);
@@ -574,8 +594,8 @@ export default class Renderer {
         });
 
         this.screenshotCanvas = document.createElement('canvas');
-        this.screenshotCanvas.width = fbo_texture_size;
-        this.screenshotCanvas.height = fbo_texture_size;
+        this.screenshotCanvas.width = pw;
+        this.screenshotCanvas.height = ph;
         this.screenshotCallback = null;
 
         this.renderParam = undefined;
@@ -637,11 +657,11 @@ export default class Renderer {
     /* Allow drawing at a different resolution than the internal texture size */
     resizeCanvas() {
         let canvas = document.getElementById('mapgen4') as HTMLCanvasElement;
-        let size = canvas.clientWidth;
-        size = 2048; /* could be smaller to increase performance */
-        if (canvas.width !== size || canvas.height !== size) {
-            console.log(`Resizing canvas from ${canvas.width}x${canvas.height} to ${size}x${size}`);
-            canvas.width = canvas.height = size;
+        const {width, height} = this.picture; /* could be smaller to increase performance */
+        if (canvas.width !== width || canvas.height !== height) {
+            console.log(`Resizing canvas from ${canvas.width}x${canvas.height} to ${width}x${height}`);
+            canvas.width = width;
+            canvas.height = height;
             this.webgl.gl.viewport(0, 0, canvas.width, canvas.height);
         }
     }
@@ -692,6 +712,8 @@ export default class Renderer {
         const light_angle_rad = Math.PI / 180 * (renderParam.light_angle_deg + renderParam.rotate_deg);
         this.drawGeneric(this.program_drape, this.fbo_drape, (gl, program) => {
             gl.uniformMatrix4fv(program.u_projection, false, this.projection);
+            gl.uniform2fv(program.u_world, [this.world.width, this.world.height]);
+            gl.uniform2fv(program.u_world_inverse, [1 / this.world.width, 1 / this.world.height]);
             gl.uniform2fv(program.u_light_angle, [Math.cos(light_angle_rad), Math.sin(light_angle_rad)]);
             gl.uniform2fv(program.u_inverse_texture_size, [1.5 / this.fbo_drape.texture.width, 1.5 / this.fbo_drape.texture.height]);
             gl.uniform1f(program.u_slope, renderParam.slope);
@@ -771,6 +793,14 @@ export default class Renderer {
             mat4.scale(this.projection, this.projection, [renderParam.zoom/100, renderParam.zoom/100, renderParam.mountain_height * renderParam.zoom/100]);
             mat4.translate(this.projection, this.projection, [-renderParam.x, -renderParam.y, 0]);
 
+            /* A picture that is not square: stretch the screen's y so a map
+             * unit is as tall as it is wide. Last, so the lean of the
+             * mountains (row y, column z above) is stretched with it. */
+            const aspect = this.picture.width / this.picture.height;
+            if (aspect !== 1) {
+                mat4.multiply(this.projection, mat4.fromScaling(mat4.create(), [1, aspect, 1]), this.projection);
+            }
+
             /* Keep track of the inverse matrix for mapping mouse to world coordinates */
             mat4.invert(this.inverse_projection, this.projection);
 
@@ -781,7 +811,7 @@ export default class Renderer {
             this.drawDrape(renderParam);
 
             /* Draw the final texture to the canvas; this slightly blurs the outlines */
-            this.drawFinal([0.5 / fbo_texture_size, 0.5 / fbo_texture_size]);
+            this.drawFinal([0.5 / this.picture.width, 0.5 / this.picture.height]);
 
             if (this.screenshotCallback) {
                 const ctx = this.screenshotCanvas.getContext('2d');
