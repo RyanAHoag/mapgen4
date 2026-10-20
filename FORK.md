@@ -16,6 +16,9 @@ optional: left out, mapgen4 draws exactly as upstream.
   a painted grid of `columns` × `rows`) and `Renderer` in `render.ts` each take
   an optional world size; the renderer's canvas and textures take its shape,
   the longer side 2048 pixels.
+- `render.ts` — an optional tint by map position, set with `setTint()`: an
+  RGBA picture of the world laid over the land's colour, its alpha saying how
+  much. Like the colour table, it knows nothing of what it is for.
 
 Everything else is upstream's, unchanged, under upstream's
 [Apache License 2.0](LICENSE).

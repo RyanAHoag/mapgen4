@@ -18,6 +18,9 @@
  *   - the renderer takes an optional world size; the canvas, the textures it
  *     draws into and the view take its shape, so a wide world fills a wide
  *     picture. Left out, it is 1000×1000 and square, as upstream.
+ *   - an optional tint by map position, set with setTint(): an RGBA picture
+ *     of the world laid over the land's colour, its alpha saying how much.
+ *     With no tint set the renderer draws exactly as upstream does.
  * See FORK.md for what this fork is and how it follows upstream.
  */
 
@@ -369,6 +372,8 @@ const frag_drape = `
     uniform sampler2D u_colormap;
     uniform highp sampler3D u_colormap3d;   // highp: samplers have no default precision in a fragment shader
     uniform float u_use_colormap3d;
+    uniform sampler2D u_tint;               // over the land's colour, by map position; alpha is how much
+    uniform float u_use_tint;
     uniform sampler2D u_elevation;
     uniform sampler2D u_water;
     uniform sampler2D u_depth;
@@ -401,7 +406,8 @@ const frag_drape = `
         float light = u_ambient + max(0.0, dot(light_vector, slope_vector));
         vec3 neutral_biome_color = neutral_land_biome;
         vec4 water_color = texture(u_water, pos);
-        if (z >= 0.5 && v_z >= 0.0) {
+        bool on_land = z >= 0.5 && v_z >= 0.0;
+        if (on_land) {
             // on land, lower the elevation around rivers
             z -= u_outline_water / 256.0 * (1.0 - water_color.a);
         } else {
@@ -411,6 +417,10 @@ const frag_drape = `
         vec3 biome_color = u_use_colormap3d > 0.5
             ? texture(u_colormap3d, vec3(z, v_em.y, v_uv.y)).rgb   // the third axis is the map's row, top to bottom
             : texture(u_colormap, vec2(z, v_em.y)).rgb;
+        if (u_use_tint > 0.5 && on_land) {
+            vec4 tint = texture(u_tint, v_uv);
+            biome_color = mix(biome_color, tint.rgb, tint.a);
+        }
         water_color = mix(vec4(neutral_water_biome * (1.2 - water_color.a), water_color.a), water_color, u_biome_colors);
         biome_color = mix(neutral_biome_color, biome_color, u_biome_colors);
         if (v_z < 0.0) {
@@ -504,6 +514,9 @@ export default class Renderer {
      * sampler always has a texture; use_colormap3d says whether to read it. */
     texture_colormap3d: WebGLTexture;
     use_colormap3d: number = 0;
+    /* The optional tint by map position: a 1×1 stand-in until one is set. */
+    texture_tint: Texture;
+    use_tint: number = 0;
 
     fbo_river: Framebuffer;
     fbo_land: Framebuffer;
@@ -564,6 +577,7 @@ export default class Renderer {
 
         this.texture_colormap = this.webgl.createTexture({data: colormap.data, width: colormap.width, height: colormap.height, filter: 'nearest'});
         this.texture_colormap3d = this.createColormap3D();
+        this.texture_tint = this.webgl.createTexture({width: 1, height: 1, data: new Uint8Array([0, 0, 0, 0]), filter: 'linear'});
 
         const {width: pw, height: ph} = this.picture;
         this.fbo_land  = this.webgl.createFramebuffer(pw, ph, {depth: false, internalFormat: this.webgl.gl.R16F, filter: 'linear'});
@@ -630,6 +644,23 @@ export default class Renderer {
         gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, width, height, depth, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
         gl.bindTexture(gl.TEXTURE_3D, null);
         this.use_colormap3d = 1;
+    }
+
+    /* A tint over the land by map position: RGBA, row 0 the top of the world,
+     * alpha how much of the tint's colour replaces the land's. Linear, so a
+     * small picture still lies smoothly. Pass null to take it away. */
+    setTint(data: Uint8Array | null, width: number, height: number) {
+        if (!data) { this.use_tint = 0; return; }
+        const {gl} = this.webgl;
+        if (this.texture_tint.width !== width || this.texture_tint.height !== height) {
+            gl.deleteTexture(this.texture_tint.id);   // its storage is fixed at its size
+            this.texture_tint = this.webgl.createTexture({width, height, data, filter: 'linear'});
+        } else {
+            gl.bindTexture(gl.TEXTURE_2D, this.texture_tint.id);
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, data);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+        }
+        this.use_tint = 1;
     }
 
     screenToWorld(coords: [number, number]): vec2 {
@@ -736,6 +767,11 @@ export default class Renderer {
             gl.activeTexture(gl.TEXTURE4);
             gl.bindTexture(gl.TEXTURE_3D, this.texture_colormap3d);
             gl.uniform1i(program.u_colormap3d, 4);
+            // Unit 5, the tint: a 2D texture, bound directly for the same reason.
+            gl.uniform1f(program.u_use_tint, this.use_tint);
+            gl.activeTexture(gl.TEXTURE5);
+            gl.bindTexture(gl.TEXTURE_2D, this.texture_tint.id);
+            gl.uniform1i(program.u_tint, 5);
 
             gl.drawElements(gl.TRIANGLES, this.quad_elements_length, gl.UNSIGNED_INT, 0);
         });
