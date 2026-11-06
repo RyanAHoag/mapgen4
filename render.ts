@@ -21,6 +21,19 @@
  *   - an optional tint by map position, set with setTint(): an RGBA picture
  *     of the world laid over the land's colour, its alpha saying how much.
  *     With no tint set the renderer draws exactly as upstream does.
+ * Changed 2026-11-06:
+ *   - an optional surface by map position, set with setSurface(): how much
+ *     of each place is dunes, broadleaf trees and conifers, and how far it is
+ *     inside or outside a forest. Fine relief — ridges across the wind,
+ *     crowns of trees — is added to the heights the light reads, never to the
+ *     height the colour is read by, so the existing light draws it. Trees
+ *     stand thick in a forest's middle and thin out towards its edge, a few
+ *     beyond it; each shades the ground behind it from the light.
+ *   - an optional wobble of the colour lookup's rain and row, so grounds meet
+ *     along wandering lines rather than along the rain's contours and the
+ *     table's rows.
+ *   - both are set with the view (updateView's surface_* keys); left out,
+ *     and with no surface set, the renderer draws exactly as upstream does.
  * See FORK.md for what this fork is and how it follows upstream.
  */
 
@@ -374,6 +387,16 @@ const frag_drape = `
     uniform float u_use_colormap3d;
     uniform sampler2D u_tint;               // over the land's colour, by map position; alpha is how much
     uniform float u_use_tint;
+    // The surface, by map position: r dunes, g broadleaf, b conifers — how much,
+    // 0 to 1 — and a the signed distance to a forest's edge, 128 + 2 per map
+    // unit, more inside.
+    uniform sampler2D u_surface;
+    uniform float u_use_surface;
+    uniform vec2 u_world;                   // the world in map units, as the vertex shader has it
+    uniform vec2 u_wind;                    // the way the wind blows, in map units, y down
+    uniform vec4 u_dunes;                   // spacing (map units), height, cover, -
+    uniform vec4 u_trees;                   // crown (map units), height, shade, variety
+    uniform vec4 u_edge;                    // taper and strays (map units), wobble of rain and of row
     uniform sampler2D u_elevation;
     uniform sampler2D u_water;
     uniform sampler2D u_depth;
@@ -390,6 +413,86 @@ const frag_drape = `
     const vec3 neutral_land_biome = vec3(0.9, 0.8, 0.7);
     const vec3 neutral_water_biome = 0.8 * neutral_land_biome;
 
+    // Hashes without sine, so they agree across GPUs.
+    float hash12(vec2 p) {
+        vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+        p3 += dot(p3, p3.yzx + 33.33);
+        return fract((p3.x + p3.y) * p3.z);
+    }
+    vec2 hash22(vec2 p) {
+        vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+        p3 += dot(p3, p3.yzx + 33.33);
+        return fract((p3.xx + p3.yz) * p3.zy);
+    }
+    float vnoise(vec2 p) {
+        vec2 i = floor(p), f = fract(p), u = f * f * (3.0 - 2.0 * f);
+        return mix(mix(hash12(i), hash12(i + vec2(1, 0)), u.x),
+                   mix(hash12(i + vec2(0, 1)), hash12(i + vec2(1, 1)), u.x), u.y);
+    }
+
+    // Dunes: ridges across the wind, a long back up it and a short steep slip
+    // face down it. The crests bend and wander, each ridge rises and falls
+    // along its length and here and there breaks, and the sand comes and goes
+    // in fields. Evenly spaced straight ridges read as corduroy, not sand.
+    float dunesAt(vec2 w) {
+        vec2 along = u_wind, across = vec2(-u_wind.y, u_wind.x);
+        float L = u_dunes.x;
+        float a = dot(w, along) / L, c = dot(w, across) / L;
+        a += 1.8 * vnoise(vec2(c * 0.22, a * 0.05)) + 0.9 * vnoise(vec2(c * 0.6 + 17.0, a * 0.15 + 3.0));
+        float ridge = floor(a), t = fract(a);
+        float h = t < 0.78 ? pow(t / 0.78, 1.15) : pow(1.0 - (t - 0.78) / 0.22, 1.6);
+        h *= smoothstep(0.15, 0.6, vnoise(vec2(c * 0.3 + ridge * 3.7, ridge * 1.3)));
+        float field = smoothstep(1.0 - u_dunes.z, 1.25 - u_dunes.z, vnoise(w / (L * 7.0) + 5.0));
+        return h * field;
+    }
+
+    // How far inside a forest a point is, in map units (outside, below 0).
+    float forestAt(vec4 s) { return (s.a * 255.0 - 128.0) * 0.5; }
+
+    // Trees: one a cell, jittered, standing only where the forest is thick
+    // enough for it — a hash of the cell against the forest's density at the
+    // cell's middle, which rises over the taper from the edge inwards and is
+    // broken by noise into clumps and clearings — so a forest thins from its
+    // middle to its edge and leaves a few trees beyond, rather than ending on
+    // a line. Each tree is broadleaf or conifer by chance, in the share the
+    // surface says, so two forests meet mingled. The tallest crown over a
+    // point is the canopy there. x the height, 0 to 1; y which tree.
+    vec2 crownsAt(vec2 w) {
+        float size = u_trees.x;
+        vec2 p = w / size, i = floor(p);
+        float best = 0.0, id = 0.5;
+        float taper = max(u_edge.x, 0.001);
+        for (int y = -1; y <= 1; y++) {
+            for (int x = -1; x <= 1; x++) {
+                vec2 cell = i + vec2(x, y);
+                vec2 o = hash22(cell);
+                vec2 centre = cell + 0.2 + 0.6 * o;
+                vec4 s = texture(u_surface, centre * size / u_world);
+                float wobble = vnoise(centre * size / max(0.5 * taper, 3.0) + 31.0) - 0.5;
+                float density = smoothstep(-u_edge.y, taper, forestAt(s) + wobble * taper);
+                if (hash12(cell + 11.7) >= density) continue;
+                float cone = hash12(cell + 5.3) < s.b / max(s.g + s.b, 0.001) ? 1.0 : 0.0;
+                float r = (0.36 + 0.24 * hash12(cell + 7.13)) * mix(0.7, 1.0, density) * mix(1.0, 0.8, cone);
+                float d = length(p - centre) / r;
+                if (d < 1.0) {
+                    float h = mix(sqrt(1.0 - d * d), 1.0 - d, cone) * (0.7 + 0.3 * o.y);
+                    if (h > best) { best = h; id = hash12(cell + 3.71); }
+                }
+            }
+        }
+        return vec2(best, id);
+    }
+    // Whether trees can stand near a point at all: inside a forest, or within its strays and a crown of it.
+    bool wooded(vec4 s) { return u_trees.y > 0.0 && forestAt(s) > -(u_edge.y + u_edge.x + 2.0 * u_trees.x); }
+    // The fine relief at a point, in the elevation texture's own units.
+    float reliefAt(vec2 uv) {
+        vec4 s = texture(u_surface, uv);
+        vec2 w = uv * u_world;
+        float h = wooded(s) ? u_trees.y * crownsAt(w).x : 0.0;
+        if (s.r > 0.004) h += s.r * u_dunes.y * dunesAt(w);
+        return h;
+    }
+
     void main() {
         vec2 sample_offset = 0.5 * u_inverse_texture_size;
         vec2 pos = v_uv + sample_offset;
@@ -401,6 +504,16 @@ const frag_drape = `
         float zN = texture(u_elevation, pos - dy).x;
         float zW = texture(u_elevation, pos - dx).x;
         float zS = texture(u_elevation, pos + dy).x;
+        // The surface's relief, added to the four heights the slope is read
+        // from and not to z: it changes the light, never the colour by height.
+        vec4 surface = vec4(0.0);
+        if (u_use_surface > 0.5 && z >= 0.5) {
+            surface = texture(u_surface, pos);
+            if (surface.r > 0.004 || wooded(surface)) {
+                zE += reliefAt(pos + dx); zN += reliefAt(pos - dy);
+                zW += reliefAt(pos - dx); zS += reliefAt(pos + dy);
+            }
+        }
         vec3 slope_vector = normalize(vec3(zS-zN, zE-zW, u_overhead * (u_inverse_texture_size.x + u_inverse_texture_size.y)));
         vec3 light_vector = normalize(vec3(u_light_angle, mix(u_slope, u_flat, slope_vector.z)));
         float light = u_ambient + max(0.0, dot(light_vector, slope_vector));
@@ -414,12 +527,35 @@ const frag_drape = `
             // in the ocean, or underground, don't draw rivers
             water_color.a = 0.0; neutral_biome_color = neutral_water_biome;
         }
+        // On land, the rain and the row the colour is looked up by wander a
+        // little, so grounds meet along wandering lines, not along the rain's
+        // contours and the table's rows. Never the height: the coast and the
+        // snow would move off the board's.
+        vec2 jw = pos * u_world;
+        float rain_at = v_em.y, row_at = v_uv.y;
+        if (on_land) {
+            rain_at += (vnoise(jw / 22.0) - 0.5 + 0.5 * (vnoise(jw / 7.0 + 3.0) - 0.5)) * u_edge.z;
+            row_at += (vnoise(jw / 37.0 + 13.0) - 0.5) * u_edge.w;
+        }
         vec3 biome_color = u_use_colormap3d > 0.5
-            ? texture(u_colormap3d, vec3(z, v_em.y, v_uv.y)).rgb   // the third axis is the map's row, top to bottom
-            : texture(u_colormap, vec2(z, v_em.y)).rgb;
+            ? texture(u_colormap3d, vec3(z, rain_at, row_at)).rgb   // the third axis is the map's row, top to bottom
+            : texture(u_colormap, vec2(z, rain_at)).rgb;
         if (u_use_tint > 0.5 && on_land) {
             vec4 tint = texture(u_tint, v_uv);
             biome_color = mix(biome_color, tint.rgb, tint.a);
+        }
+        // Trees: each crown shades the ground behind it from the light, the
+        // floor between crowns is darker where the forest is thick, and no two
+        // trees are quite one green.
+        if (on_land && u_use_surface > 0.5 && wooded(surface)) {
+            vec2 to_light = -normalize(vec2(u_light_angle.y, u_light_angle.x));
+            vec2 crown = crownsAt(jw);
+            float there = crownsAt(jw + to_light * u_trees.x * 0.45).x;
+            float shadow = clamp((there - crown.x) * 1.5, 0.0, 1.0);
+            float thick = smoothstep(0.0, max(u_edge.x, 0.001), forestAt(surface));
+            float shade = u_trees.z * (0.55 * shadow + 0.25 * (1.0 - crown.x) * thick);
+            float variety = crown.x > 0.0 ? u_trees.w * (crown.y - 0.5) : 0.0;
+            biome_color *= (1.0 - shade) * (1.0 + variety);
         }
         water_color = mix(vec4(neutral_water_biome * (1.2 - water_color.a), water_color.a), water_color, u_biome_colors);
         biome_color = mix(neutral_biome_color, biome_color, u_biome_colors);
@@ -517,6 +653,9 @@ export default class Renderer {
     /* The optional tint by map position: a 1×1 stand-in until one is set. */
     texture_tint: Texture;
     use_tint: number = 0;
+    /* The optional surface by map position: a 1×1 stand-in, no forest anywhere, until one is set. */
+    texture_surface: Texture;
+    use_surface: number = 0;
 
     fbo_river: Framebuffer;
     fbo_land: Framebuffer;
@@ -578,6 +717,7 @@ export default class Renderer {
         this.texture_colormap = this.webgl.createTexture({data: colormap.data, width: colormap.width, height: colormap.height, filter: 'nearest'});
         this.texture_colormap3d = this.createColormap3D();
         this.texture_tint = this.webgl.createTexture({width: 1, height: 1, data: new Uint8Array([0, 0, 0, 0]), filter: 'linear'});
+        this.texture_surface = this.webgl.createTexture({width: 1, height: 1, data: new Uint8Array([0, 0, 0, 0]), filter: 'linear'});
 
         const {width: pw, height: ph} = this.picture;
         this.fbo_land  = this.webgl.createFramebuffer(pw, ph, {depth: false, internalFormat: this.webgl.gl.R16F, filter: 'linear'});
@@ -661,6 +801,27 @@ export default class Renderer {
             gl.bindTexture(gl.TEXTURE_2D, null);
         }
         this.use_tint = 1;
+    }
+
+    /* The surface by map position: RGBA, row 0 the top of the world; r dunes,
+     * g broadleaf trees, b conifers, each how much from 0 to 255, and a the
+     * signed distance to a forest's edge, 128 + 2 per map unit, more inside.
+     * Linear, so a small picture lies smoothly. Null takes it away. What it
+     * looks like is set with the view: surface_wind [x, y], surface_dunes
+     * [spacing, height, cover, 0], surface_trees [crown, height, shade,
+     * variety], surface_edge [taper, strays, rain wobble, row wobble]. */
+    setSurface(data: Uint8Array | null, width: number, height: number) {
+        if (!data) { this.use_surface = 0; return; }
+        const {gl} = this.webgl;
+        if (this.texture_surface.width !== width || this.texture_surface.height !== height) {
+            gl.deleteTexture(this.texture_surface.id);   // its storage is fixed at its size
+            this.texture_surface = this.webgl.createTexture({width, height, data, filter: 'linear'});
+        } else {
+            gl.bindTexture(gl.TEXTURE_2D, this.texture_surface.id);
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, data);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+        }
+        this.use_surface = 1;
     }
 
     screenToWorld(coords: [number, number]): vec2 {
@@ -772,6 +933,15 @@ export default class Renderer {
             gl.activeTexture(gl.TEXTURE5);
             gl.bindTexture(gl.TEXTURE_2D, this.texture_tint.id);
             gl.uniform1i(program.u_tint, 5);
+            // Unit 6, the surface; its looks come with the view, and nothing given is nothing drawn.
+            gl.uniform1f(program.u_use_surface, this.use_surface);
+            gl.activeTexture(gl.TEXTURE6);
+            gl.bindTexture(gl.TEXTURE_2D, this.texture_surface.id);
+            gl.uniform1i(program.u_surface, 6);
+            gl.uniform2fv(program.u_wind, renderParam.surface_wind ?? [1, 0]);
+            gl.uniform4fv(program.u_dunes, renderParam.surface_dunes ?? [5, 0, 0, 0]);
+            gl.uniform4fv(program.u_trees, renderParam.surface_trees ?? [3.5, 0, 0, 0]);
+            gl.uniform4fv(program.u_edge, renderParam.surface_edge ?? [0, 0, 0, 0]);
 
             gl.drawElements(gl.TRIANGLES, this.quad_elements_length, gl.UNSIGNED_INT, 0);
         });

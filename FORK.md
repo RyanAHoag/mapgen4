@@ -19,6 +19,15 @@ optional: left out, mapgen4 draws exactly as upstream.
 - `render.ts` — an optional tint by map position, set with `setTint()`: an
   RGBA picture of the world laid over the land's colour, its alpha saying how
   much. Like the colour table, it knows nothing of what it is for.
+- `render.ts` — an optional surface by map position, set with `setSurface()`:
+  how much of each place is dunes, broadleaf trees and conifers, and how far it
+  is inside or outside a forest. The drape adds fine relief there — ridges
+  across the wind, crowns of trees — to the heights the light reads, never to
+  the height the colour is read by; trees stand thick in a forest's middle and
+  thin towards its edge, and each shades the ground behind it. With it, an
+  optional wobble of the colour lookup's rain and row, so grounds meet along
+  wandering lines. Both are set with the view (`updateView`'s `surface_*`
+  keys) and, like the tint, know nothing of what they are for.
 
 Everything else is upstream's, unchanged, under upstream's
 [Apache License 2.0](LICENSE).
