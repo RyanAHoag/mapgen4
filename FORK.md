@@ -28,6 +28,16 @@ optional: left out, mapgen4 draws exactly as upstream.
   optional wobble of the colour lookup's rain and row, so grounds meet along
   wandering lines. Both are set with the view (`updateView`'s `surface_*`
   keys) and, like the tint, know nothing of what they are for.
+- `render.ts` — optional covers by map position, set with `setCovers()`:
+  dead woods, rock, fields, marsh and towns. Each thing on them — a bare tree,
+  a boulder, a field, a reed clump, a building — stands whole or not at all,
+  by the cover at its own middle, so a cover's edge is a ragged line of
+  things, never a blur. Fields and buildings take their colours from a
+  palette, a row per id; buildings are boxes that lean up the page by their
+  height, as the land does by `mountain_height`, taller towards a town's
+  middle as much as it rises. Under fields and towns the land's slope is read
+  wide, so its fine wrinkles do not buckle them. Like the rest, it knows
+  nothing of what they are for.
 
 Everything else is upstream's, unchanged, under upstream's
 [Apache License 2.0](LICENSE).
